@@ -1,0 +1,23 @@
+$user = App\Models\User::where('email', 'demo@example.com')->first();
+$user->password = Hash::make('your-new-secure-password');
+$user->save();
+
+
+
+
+
+$user = App\Models\User::where('email', 'societyadmin@test.com')->first();
+$user->password = Hash::make('societyadmin@test.com');
+$user->save();
+
+$user = App\Models\User::where('email', 'secondadmin@test.com')->first();
+$user->password = Hash::make('secondadmin@test.com');
+$user->save();
+
+$user = App\Models\User::where('email', 'admin@test.com')->first();
+$user->password = Hash::make('admin@test.com');
+$user->save();
+
+$user = App\Models\User::where('email', 'amaka@test.com')->first();
+$user->password = Hash::make('amaka@test.com');
+$user->save();

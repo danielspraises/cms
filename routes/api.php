@@ -127,6 +127,7 @@ Route::middleware(['auth:sanctum', 'ensure.society.scope'])->prefix('societies/{
     });
 
     Route::middleware('permission:loans.view')->group(function () {
+        Route::get('/loan-applications', [LoanApplicationController::class, 'index']);
         Route::get('/loan-applications/my-queue', [LoanApplicationController::class, 'myQueue']);
     });
 

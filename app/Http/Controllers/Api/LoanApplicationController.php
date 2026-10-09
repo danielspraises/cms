@@ -16,7 +16,40 @@ class LoanApplicationController extends Controller
     public function show(Request $request, LoanApplication $application)
     {
         abort_unless($request->user()->canActOnSociety($application->society_id), 404);
-        return $application->load(['member', 'product', 'guarantors.guarantor', 'actions.actor', 'currentStage']);
+        $application->load(['member', 'product', 'guarantors.guarantor', 'actions.actor', 'currentStage']);
+
+        // Tells the screen whether THIS user can act right now, using the same
+        // checks act() enforces, so the UI never has to guess.
+        $user = $request->user();
+        $stage = $application->currentStage;
+        $actionable = in_array($application->status, ['in_review', 'approved'], true);
+
+        $application->setAttribute('can_act', $actionable
+            && $stage !== null
+            && $stage->canBeActedOnBy($user)
+            && ($stage->action_type === 'disburse'
+                || !in_array($user->id, $application->actorsWhoHaveActed(), true)));
+
+        return $application;
+    }
+
+    /**
+     * Lists every loan application for the society. myQueue() only shows
+     * applications awaiting THIS user's action; this lets an admin browse
+     * everything regardless of whose turn it is.
+     */
+    public function index(Request $request)
+    {
+        $societyId = $request->attributes->get('society_id');
+
+        $query = LoanApplication::where('society_id', $societyId)
+            ->with(['member:id,full_name,member_uid', 'product:id,name', 'currentStage:id,name']);
+
+        if ($status = $request->query('status')) {
+            $query->where('status', $status);
+        }
+
+        return $query->orderByDesc('created_at')->paginate(25);
     }
 
     /** Member applies for a loan. */
@@ -27,7 +60,7 @@ class LoanApplicationController extends Controller
             'requested_principal_minor' => 'required|integer|min:1',
             'requested_tenure_months' => 'required|integer|min:1',
             'purpose' => 'nullable|string',
-            'guarantor_member_ids' => 'array', // required only if the product needs guarantors
+            'guarantor_member_ids' => 'array',
             'guarantor_member_ids.*' => 'exists:users,id',
         ]);
 
@@ -63,7 +96,7 @@ class LoanApplicationController extends Controller
         return $updated;
     }
 
-    /** The core action endpoint — recommend / approve / reject / disburse, per current stage. */
+    /** The core action endpoint: recommend / approve / reject / disburse, per current stage. */
     public function act(Request $request, LoanApplication $application)
     {
         abort_unless($request->user()->canActOnSociety($application->society_id), 404);
@@ -106,7 +139,7 @@ class LoanApplicationController extends Controller
         return $updated;
     }
 
-    /** Queue of applications currently awaiting THIS user's action, across whatever stage they're eligible for. */
+    /** Applications currently awaiting THIS user's action, across whatever stage they're eligible for. */
     public function myQueue(Request $request)
     {
         $user = $request->user();
