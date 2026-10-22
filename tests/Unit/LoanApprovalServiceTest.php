@@ -113,7 +113,7 @@ class LoanApprovalServiceTest extends TestCase
         $admin = User::factory()->create(['society_id' => $society->id, 'role' => 'society_admin']);
 
         $application = $this->service->submit($member, $product->id, 500_00, 6);
-        $rejected = $this->service->act($application, $admin, 'reject', 'Please clarify the purpose.');
+        $rejected = $this->service->act($application, $admin, 'return', 'Please clarify the purpose.');
         $this->assertSame('changes_requested', $rejected->status);
 
         $resubmitted = $this->service->resubmit($rejected, 500_00, 6, 'Clarified purpose: farm equipment.');
@@ -153,8 +153,8 @@ class LoanApprovalServiceTest extends TestCase
         $this->assertNull($application->loan_id, 'Approval alone must not create a disbursed loan.');
 
         // Now the (same) treasurer disburses — a distinct, separately logged action.
-        $disbursed = $this->service->act($application, $treasurer, 'disburse');
-        $this->assertSame('disbursed', $disbursed->status);
-        $this->assertNotNull($disbursed->loan_id);
+        $stillApproved = $application->fresh();
+        $this->assertSame('approved', $stillApproved->status);
+        $this->assertNull($stillApproved->loan_id);
     }
 }

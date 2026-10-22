@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Exceptions\ApprovalActionException;
+use App\Models\ApprovalStage;
 use App\Models\LoanApplication;
 use App\Models\LoanApprovalAction;
 use App\Models\LoanGuarantor;
@@ -10,19 +11,14 @@ use App\Models\User;
 use Illuminate\Support\Facades\DB;
 
 /**
- * The engine behind blueprint §7. Enforces, in order, on every action:
- *   1. The guarantor gate (nothing enters stage 1 until guarantors have accepted,
- *      for products that require them).
- *   2. Stage eligibility (is this user's role/permission the one this stage requires).
- *   3. Segregation of duty for the REVIEW chain (recommend/approve/reject) — has
- *      this exact user already acted on this exact application, at any review
- *      stage, applies to every role including society_admin. Deliberately does
- *      NOT apply to the disburse stage — a single-treasurer society needs the
- *      same person able to both recommend and later disburse.
- *   4. Advances current_stage on recommend/approve, closes out on reject/disburse.
- *
- * Disbursement is deliberately a separate call (still routed through act()),
- * not something approving the loan triggers automatically — see blueprint §7.1.
+ * Engine for the multi-stage chain. The review steps (recommend / approve) offer
+ * three outcomes: move forward, reject (final), or return (one step back).
+ * After approval come three operational steps, each owned by one role:
+ *   prepare   the settlement sheet     (society admin)
+ *   disburse  the payout               (treasurer)
+ *   confirm   cross-check and posting  (society admin)
+ * This engine only records and advances. The sheet and the ledger posting are
+ * done by DisbursementService; nothing here writes to the ledger.
  */
 class LoanApprovalService
 {
@@ -86,9 +82,6 @@ class LoanApprovalService
         return DB::transaction(function () use ($application, $actor, $decision, $notes) {
             $application = LoanApplication::query()->lockForUpdate()->findOrFail($application->id);
 
-            // 'approved' is a valid status to act from too — that's the
-            // whole point of disbursement being a separate step after
-            // approval, not folded into it.
             if (!in_array($application->status, ['in_review', 'approved'], true)) {
                 throw new ApprovalActionException("Application is not currently actionable (status: {$application->status}).");
             }
@@ -102,28 +95,33 @@ class LoanApprovalService
                 throw new ApprovalActionException('You do not hold the role/permission required for this stage.');
             }
 
-            // Segregation of duty applies to the review chain
-            // (recommend/approve/reject) — deliberately exempted for
-            // disbursement. Confirmed requirement: in a single-treasurer
-            // society, the same person who recommended is expected to also
-            // be the one who disburses. Disbursement is a distinct,
-            // separately logged action, not a second opinion on the loan.
-            if ($stage->action_type !== 'disburse'
-                && in_array($actor->id, $application->actorsWhoHaveActed(), true)) {
-                throw new ApprovalActionException('You have already acted on this application and cannot act again.');
-            }
-
-            if ($stage->notes_required && $decision !== 'reject' && empty($notes)) {
-                throw new ApprovalActionException('Notes are required for this stage.');
+            // Segregation of duty covers the REVIEW steps only: nobody may act
+            // at a second, different review step in the same review cycle.
+            // Acting again at your own step is fine (that is what a return to
+            // you looks like). The operational steps after approval are exempt.
+            $isReviewStage = in_array($stage->action_type, ['recommend', 'approve'], true);
+            if ($isReviewStage && $application->hasActedAtAnotherStage($actor->id, $stage->id)) {
+                throw new ApprovalActionException('You have already acted on this application at another stage and cannot act again.');
             }
 
             $validDecisions = match ($stage->action_type) {
-                'recommend' => ['recommend', 'reject'],
-                'approve' => ['approve', 'reject'],
-                'disburse' => ['disburse'],
+                'recommend' => ['recommend', 'reject', 'return'],
+                'approve' => ['approve', 'reject', 'return'],
+                'prepare' => ['prepare'],
+                'disburse' => ['disburse', 'return'],
+                'confirm' => ['confirm', 'return'],
             };
             if (!in_array($decision, $validDecisions, true)) {
                 throw new ApprovalActionException("Invalid decision '{$decision}' for a {$stage->action_type} stage.");
+            }
+
+            $notes = trim((string) $notes);
+            if (in_array($decision, ['reject', 'return'], true)) {
+                if ($notes === '') {
+                    throw new ApprovalActionException('A written reason is required to ' . $decision . ' an application.');
+                }
+            } elseif ($stage->notes_required && $notes === '') {
+                throw new ApprovalActionException('Notes are required for this stage.');
             }
 
             LoanApprovalAction::create([
@@ -131,7 +129,7 @@ class LoanApprovalService
                 'stage_id' => $stage->id,
                 'actor_id' => $actor->id,
                 'decision' => $decision,
-                'notes' => $notes,
+                'notes' => $notes === '' ? null : $notes,
                 'review_cycle' => $application->review_cycle,
             ]);
 
@@ -139,42 +137,33 @@ class LoanApprovalService
                 return $this->handleRejection($application);
             }
 
-            if ($decision === 'disburse') {
-                return $this->handleDisbursement($application, $actor);
+            if ($decision === 'return') {
+                return $this->handleReturn($application, $stage);
             }
 
-            if ($decision === 'approve') {
-                // Approval ALWAYS produces 'approved' status immediately —
-                // this no longer depends on whether a disburse stage
-                // follows. If one does, current_stage moves to it so the
-                // disburse action's own eligibility check has something to
-                // check against; if this was the workflow's last stage,
-                // current_stage_id goes to null and the application simply
-                // waits in 'approved' status (a workflow with no disburse
-                // stage has no further action modeled here — a known
-                // limitation worth flagging if you build a workflow that way).
-                $nextStage = $application->workflow->stages()
-                    ->where('sequence', '>', $stage->sequence)
-                    ->first();
-
-                $application->update([
-                    'status' => 'approved',
-                    'current_stage_id' => $nextStage?->id,
-                ]);
+            if ($decision === 'confirm') {
+                // Final step. DisbursementService has posted the ledger entries
+                // and recorded the loan before it calls this.
+                $application->update(['status' => 'disbursed', 'current_stage_id' => null]);
 
                 return $application->fresh();
             }
 
-            // decision === 'recommend' — advance to the next stage. A
-            // recommend stage with nothing after it is a workflow
-            // misconfiguration (a chain should always end in approve) —
-            // fail loudly rather than silently stalling the application.
             $nextStage = $application->workflow->stages()
                 ->where('sequence', '>', $stage->sequence)
                 ->first();
 
+            if ($decision === 'approve') {
+                // Approval always produces 'approved' immediately and never
+                // moves money. The next step (settlement) becomes current.
+                $application->update(['status' => 'approved', 'current_stage_id' => $nextStage?->id]);
+
+                return $application->fresh();
+            }
+
+            // recommend, prepare, disburse: advance to the next step.
             if (!$nextStage) {
-                throw new ApprovalActionException('Workflow is misconfigured: no stage follows this recommend stage.');
+                throw new ApprovalActionException('Workflow is misconfigured: no step follows this one.');
             }
 
             $application->update(['current_stage_id' => $nextStage->id]);
@@ -183,27 +172,48 @@ class LoanApprovalService
         });
     }
 
+    /** Rejection is final. Sending something back is what "return" is for. */
     private function handleRejection(LoanApplication $application): LoanApplication
     {
-        $mode = $application->product->rejection_mode;
-
-        $application->update([
-            'status' => $mode === 'return_for_changes' ? 'changes_requested' : 'rejected',
-            'current_stage_id' => null,
-        ]);
+        $application->update(['status' => 'rejected', 'current_stage_id' => null]);
 
         return $application->fresh();
     }
 
     /**
-     * Applicant edits and resubmits after 'changes_requested'. Resets to the
-     * top of the chain AND resets segregation-of-duty eligibility — this is
-     * functionally a fresh review cycle of changed material, per blueprint §7.4.
+     * Sends the application back one step. From any step after the first it goes
+     * to the previous step (still in the same review cycle). From the first step
+     * it goes back to the applicant; resubmitting restarts the chain.
+     */
+    private function handleReturn(LoanApplication $application, ApprovalStage $stage): LoanApplication
+    {
+        $previous = $application->workflow->stages()
+            ->where('sequence', '<', $stage->sequence)
+            ->reorder('sequence', 'desc')
+            ->first();
+
+        if ($previous) {
+            $afterApproval = in_array($previous->action_type, ['prepare', 'disburse', 'confirm'], true);
+            $application->update([
+                'status' => $afterApproval ? 'approved' : 'in_review',
+                'current_stage_id' => $previous->id,
+            ]);
+        } else {
+            $application->update(['status' => 'changes_requested', 'current_stage_id' => null]);
+        }
+
+        return $application->fresh();
+    }
+
+    /**
+     * Applicant edits and resubmits after being returned. Restarts the chain and
+     * starts a new review cycle, which resets segregation-of-duty eligibility
+     * (prior actions stay in the log for history).
      */
     public function resubmit(LoanApplication $application, int $newRequestedPrincipalMinor, int $newTenureMonths, ?string $newPurpose = null): LoanApplication
     {
         if ($application->status !== 'changes_requested') {
-            throw new ApprovalActionException('Only applications in changes_requested status can be resubmitted.');
+            throw new ApprovalActionException('Only applications that were returned to the applicant can be resubmitted.');
         }
 
         $application->update([
@@ -215,38 +225,6 @@ class LoanApprovalService
                 ? null : $application->workflow->stages()->first()?->id,
             'review_cycle' => $application->review_cycle + 1,
         ]);
-
-        return $application->fresh();
-    }
-
-    private function handleDisbursement(LoanApplication $application, User $actor): LoanApplication
-    {
-        $loan = \App\Models\Loan::create([
-            'society_id' => $application->society_id,
-            'member_id' => $application->member_id,
-            'loan_product_id' => $application->loan_product_id,
-            'principal_disbursed_minor' => $application->requested_principal_minor,
-            'tenure_months' => $application->requested_tenure_months,
-            'disbursement_date' => now(),
-            'status' => 'active',
-        ]);
-
-        $this->ledger->postEntry(
-            societyId: $application->society_id,
-            entryDate: now(),
-            description: "Loan disbursement: {$application->product->name}",
-            source: 'manual',
-            lines: [[
-                'user_id' => $application->member_id,
-                'account_type' => 'loan_principal',
-                'direction' => 'debit',
-                'amount_minor' => $application->requested_principal_minor,
-            ]],
-            createdBy: $actor->id,
-            loanId: $loan->id,
-        );
-
-        $application->update(['status' => 'disbursed', 'loan_id' => $loan->id]);
 
         return $application->fresh();
     }

@@ -29,7 +29,7 @@ class ApprovalWorkflowController extends Controller
             'name' => 'required|string',
             'stages' => 'required|array|min:1',
             'stages.*.name' => 'required|string',
-            'stages.*.action_type' => 'required|in:recommend,approve,disburse',
+            'stages.*.action_type' => 'required|in:recommend,approve,prepare,disburse,confirm',
             'stages.*.assignment_type' => 'required|in:role,permission',
             'stages.*.assignment_role_id' => 'required_if:stages.*.assignment_type,role|nullable|exists:roles,id',
             'stages.*.assignment_permission_key' => 'required_if:stages.*.assignment_type,permission|nullable|exists:permissions,key',

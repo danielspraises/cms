@@ -1,0 +1,105 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class LoanApplication extends Model
+{
+    protected $fillable = [
+        'society_id', 'member_id', 'loan_product_id', 'workflow_id',
+        'requested_principal_minor', 'requested_tenure_months', 'purpose',
+        'status', 'current_stage_id', 'loan_id', 'review_cycle',
+    ];
+
+    public function member(): BelongsTo
+    {
+        return $this->belongsTo(User::class, 'member_id');
+    }
+
+    public function product(): BelongsTo
+    {
+        return $this->belongsTo(LoanProduct::class, 'loan_product_id');
+    }
+
+    public function workflow(): BelongsTo
+    {
+        return $this->belongsTo(ApprovalWorkflow::class, 'workflow_id');
+    }
+
+    public function currentStage(): BelongsTo
+    {
+        return $this->belongsTo(ApprovalStage::class, 'current_stage_id');
+    }
+
+    public function guarantors(): HasMany
+    {
+        return $this->hasMany(LoanGuarantor::class, 'loan_application_id');
+    }
+
+    public function actions(): HasMany
+    {
+        return $this->hasMany(LoanApprovalAction::class)->orderBy('created_at')->orderBy('id');
+    }
+
+    public function allGuarantorsAccepted(): bool
+    {
+        if (!$this->product->requires_guarantors) {
+            return true;
+        }
+
+        $guarantors = $this->guarantors;
+        return $guarantors->count() >= $this->product->guarantors_required
+            && $guarantors->every(fn (LoanGuarantor $g) => $g->status === 'accepted');
+    }
+
+    /** Every user who has acted on this application in the CURRENT review cycle. */
+    public function actorsWhoHaveActed(): array
+    {
+        return $this->actions()
+            ->where('review_cycle', $this->review_cycle)
+            ->pluck('actor_id')
+            ->unique()
+            ->all();
+    }
+
+    /**
+     * Segregation of duty for the review chain: has this user already acted, in
+     * the current review cycle, at a DIFFERENT review step (recommend/approve)?
+     * Acting again at the same step is allowed, which is what happens when an
+     * application is returned to you. Guarantor actions have no step and count
+     * as "another step", so a guarantor cannot also review the loan. The
+     * operational steps after approval (settlement, disbursement, cross-check)
+     * are not review steps and are never counted.
+     */
+    public function hasActedAtAnotherStage(int $userId, int $stageId): bool
+    {
+        return $this->actions()
+            ->where('review_cycle', $this->review_cycle)
+            ->where('actor_id', $userId)
+            ->where(function ($q) use ($stageId) {
+                $q->whereNull('stage_id')
+                    ->orWhereHas('stage', function ($s) use ($stageId) {
+                        $s->where('approval_stages.id', '!=', $stageId)
+                            ->whereIn('approval_stages.action_type', ['recommend', 'approve']);
+                    });
+            })
+            ->exists();
+    }
+
+    /** The step before the current one, or null when the current step is the first. */
+    public function previousStage(): ?ApprovalStage
+    {
+        $current = $this->currentStage;
+        if (!$current) {
+            return null;
+        }
+
+        return $this->workflow->stages()
+            ->where('sequence', '<', $current->sequence)
+            ->reorder('sequence', 'desc')
+            ->first();
+    }
+}

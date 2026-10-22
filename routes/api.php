@@ -155,6 +155,10 @@ Route::middleware(['auth:sanctum'])->group(function () {
 
     Route::get('/loan-applications/{application}', [LoanApplicationController::class, 'show']);
     Route::post('/loan-applications/{application}/act', [LoanApplicationController::class, 'act']);
+    Route::get('/loan-applications/{application}/disbursement', [\App\Http\Controllers\Api\DisbursementController::class, 'show']);
+    Route::post('/loan-applications/{application}/disbursement/prepare', [\App\Http\Controllers\Api\DisbursementController::class, 'prepare']);
+    Route::post('/loan-applications/{application}/disbursement/pay', [\App\Http\Controllers\Api\DisbursementController::class, 'pay']);
+    Route::post('/loan-applications/{application}/disbursement/confirm', [\App\Http\Controllers\Api\DisbursementController::class, 'confirm']);
 
     // Pure member self-service — no society-mode switching applies, a member
     // only ever acts as themselves.

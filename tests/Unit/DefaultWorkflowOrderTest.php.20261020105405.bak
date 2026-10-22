@@ -1,0 +1,122 @@
+<?php
+
+namespace Tests\Unit;
+
+use App\Exceptions\ApprovalActionException;
+use App\Models\LoanApplication;
+use App\Models\LoanProduct;
+use App\Models\Role;
+use App\Models\Society;
+use App\Models\User;
+use App\Services\LedgerService;
+use App\Services\LoanApprovalService;
+use App\Services\SocietyProvisioningService;
+use Database\Seeders\PermissionSeeder;
+use Database\Seeders\RoleSeeder;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Tests\TestCase;
+
+/**
+ * Uses the workflow a brand-new society actually gets, so this catches the
+ * problem where someone could take a step that belongs to someone else.
+ */
+class DefaultWorkflowOrderTest extends TestCase
+{
+    use RefreshDatabase;
+
+    private LoanApprovalService $service;
+    private Society $society;
+    private User $admin;
+    private User $treasurer;
+    private User $approver;
+    private User $platformAdmin;
+    private LoanApplication $application;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+
+        $this->seed(PermissionSeeder::class);
+        $this->seed(RoleSeeder::class);
+
+        $this->service = new LoanApprovalService(new LedgerService());
+        $this->society = Society::factory()->create();
+
+        $provisioning = new SocietyProvisioningService();
+        $provisioning->provision($this->society);
+
+        $this->admin = User::factory()->create(['society_id' => $this->society->id, 'role' => 'society_admin']);
+        $provisioning->grantSocietyAdminRole($this->society, $this->admin);
+
+        $this->treasurer = $this->staffWithRole('treasurer');
+        $this->approver = $this->staffWithRole('approver');
+        $this->platformAdmin = User::factory()->create(['society_id' => null, 'role' => 'platform_admin']);
+
+        $product = LoanProduct::factory()->create([
+            'society_id' => $this->society->id,
+            'requires_guarantors' => false,
+        ]);
+        $member = User::factory()->create(['society_id' => $this->society->id, 'role' => 'member']);
+
+        $this->application = $this->service->submit($member, $product->id, 500_00, 6);
+    }
+
+    private function staffWithRole(string $slug): User
+    {
+        $user = User::factory()->create(['society_id' => $this->society->id, 'role' => 'staff']);
+        $user->roles()->attach(
+            Role::where('society_id', $this->society->id)->where('slug', $slug)->firstOrFail()
+        );
+
+        return $user;
+    }
+
+    private function assertCannotAct(User $user): void
+    {
+        try {
+            $this->service->act($this->application, $user, 'recommend', 'Trying to act out of turn.');
+        } catch (ApprovalActionException $e) {
+            $this->assertStringContainsString('role/permission', $e->getMessage());
+            return;
+        }
+
+        $this->fail('Expected this person to be refused.');
+    }
+
+    public function test_only_the_society_admin_can_take_the_first_step(): void
+    {
+        $this->assertCannotAct($this->treasurer);
+        $this->assertCannotAct($this->approver);
+        $this->assertCannotAct($this->platformAdmin);
+
+        $moved = $this->service->act($this->application, $this->admin, 'recommend', 'Checked.');
+
+        $this->assertSame(2, $moved->currentStage->sequence);
+    }
+
+    public function test_every_step_belongs_only_to_its_own_role_and_runs_in_order(): void
+    {
+        // Step 1: society admin only
+        $this->service->act($this->application, $this->admin, 'recommend', 'Checked.');
+
+        // Step 2: treasurer only
+        $this->assertCannotAct($this->admin);
+        $this->assertCannotAct($this->approver);
+        $this->assertCannotAct($this->platformAdmin);
+        $this->service->act($this->application, $this->treasurer, 'recommend', 'Confirmed.');
+
+        // Step 3: approver only
+        $this->assertCannotAct($this->admin);
+        $this->assertCannotAct($this->treasurer);
+        $this->assertCannotAct($this->platformAdmin);
+        $approved = $this->service->act($this->application, $this->approver, 'approve');
+        $this->assertSame('approved', $approved->status);
+
+        // Step 4: disbursement, treasurer only (not the society admin)
+        $this->assertCannotAct($this->admin);
+        $this->assertCannotAct($this->approver);
+        $this->assertCannotAct($this->platformAdmin);
+        $disbursed = $this->service->act($this->application, $this->treasurer, 'disburse');
+        $this->assertSame('disbursed', $disbursed->status);
+    }
+}

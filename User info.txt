@@ -7,17 +7,23 @@ $user->save();
 
 
 $user = App\Models\User::where('email', 'societyadmin@test.com')->first();
-$user->password = Hash::make('societyadmin@test.com');
+$user->password = Hash::make('password123');
 $user->save();
 
-$user = App\Models\User::where('email', 'secondadmin@test.com')->first();
-$user->password = Hash::make('secondadmin@test.com');
-$user->save();
+
 
 $user = App\Models\User::where('email', 'admin@test.com')->first();
-$user->password = Hash::make('admin@test.com');
+$user->password = Hash::make('password123');
 $user->save();
 
 $user = App\Models\User::where('email', 'amaka@test.com')->first();
-$user->password = Hash::make('amaka@test.com');
+$user->password = Hash::make('password123');
+$user->save();
+
+$user = App\Models\User::where('email', 'treasurer@test.com')->first();
+$user->password = Hash::make('password123');
+$user->save();
+
+$user = App\Models\User::where('email', 'president@test.com')->first();
+$user->password = Hash::make('password123');
 $user->save();

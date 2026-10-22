@@ -1,0 +1,110 @@
+<?php
+
+namespace App\Services;
+
+use App\Models\ApprovalWorkflow;
+use App\Models\Role;
+use App\Models\Society;
+use App\Models\User;
+
+/**
+ * Everything a brand-new society needs seeded at creation time.
+ */
+class SocietyProvisioningService
+{
+    public function provision(Society $society): void
+    {
+        $clonedRoles = $this->cloneSystemRoleTemplates($society);
+        $this->createDefaultWorkflow($society, $clonedRoles);
+    }
+
+    /**
+     * Gives a society admin the Society Admin role, which is what the first
+     * review step is assigned to. Call this for every society admin created.
+     */
+    public function grantSocietyAdminRole(Society $society, User $user): void
+    {
+        $role = Role::where('society_id', $society->id)->where('slug', 'society-admin')->first();
+
+        if ($role) {
+            $user->roles()->syncWithoutDetaching([$role->id => ['assigned_at' => now()]]);
+        }
+    }
+
+    private function cloneSystemRoleTemplates(Society $society): array
+    {
+        $clones = [];
+
+        foreach (Role::whereNull('society_id')->with('permissions')->get() as $template) {
+            $copy = Role::create([
+                'society_id' => $society->id,
+                'name' => $template->name,
+                'slug' => $template->slug,
+                'is_system' => true,
+            ]);
+            $copy->permissions()->sync($template->permissions->pluck('id'));
+            $clones[$template->slug] = $copy;
+        }
+
+        return $clones;
+    }
+
+    /**
+     * Builds the default chain. Every step is assigned to ONE role, so nobody
+     * can take a step that belongs to someone else:
+     *   1. Society Admin Review (recommend)  - Society Admin role
+     *   2. Treasurer Review (recommend)      - Treasurer role
+     *   3. Final Approval (approve)          - Approver role
+     *   4. Disbursement (disburse)           - Treasurer role
+     */
+    private function createDefaultWorkflow(Society $society, array $clonedRoles): void
+    {
+        foreach (['society-admin', 'treasurer', 'approver'] as $slug) {
+            if (!isset($clonedRoles[$slug])) {
+                throw new \RuntimeException("The '{$slug}' role template is missing. Run: php artisan db:seed --class=RoleSeeder");
+            }
+        }
+
+        $workflow = ApprovalWorkflow::create([
+            'society_id' => $society->id,
+            'name' => 'Standard Loan Approval',
+            'is_default' => true,
+        ]);
+
+        $workflow->stages()->create([
+            'sequence' => 1,
+            'name' => 'Society Admin Review',
+            'action_type' => 'recommend',
+            'assignment_type' => 'role',
+            'assignment_role_id' => $clonedRoles['society-admin']->id,
+            'notes_required' => true,
+        ]);
+
+        $workflow->stages()->create([
+            'sequence' => 2,
+            'name' => 'Treasurer Review',
+            'action_type' => 'recommend',
+            'assignment_type' => 'role',
+            'assignment_role_id' => $clonedRoles['treasurer']->id,
+            'notes_required' => true,
+        ]);
+
+        $workflow->stages()->create([
+            'sequence' => 3,
+            'name' => 'Final Approval',
+            'action_type' => 'approve',
+            'assignment_type' => 'role',
+            'assignment_role_id' => $clonedRoles['approver']->id,
+            'notes_required' => false,
+        ]);
+
+        $workflow->stages()->create([
+            'sequence' => 4,
+            'name' => 'Disbursement',
+            'action_type' => 'disburse',
+            'assignment_type' => 'role',
+            'assignment_role_id' => $clonedRoles['treasurer']->id,
+            'notes_required' => false,
+        ]);
+    }
+}

@@ -41,13 +41,13 @@ class LoanApplication extends Model
 
     public function actions(): HasMany
     {
-        return $this->hasMany(LoanApprovalAction::class)->orderBy('created_at');
+        return $this->hasMany(LoanApprovalAction::class)->orderBy('created_at')->orderBy('id');
     }
 
     public function allGuarantorsAccepted(): bool
     {
         if (!$this->product->requires_guarantors) {
-            return true; // gate doesn't apply
+            return true;
         }
 
         $guarantors = $this->guarantors;
@@ -55,7 +55,7 @@ class LoanApplication extends Model
             && $guarantors->every(fn (LoanGuarantor $g) => $g->status === 'accepted');
     }
 
-    /** Every user who has already acted on THIS application, in the CURRENT review cycle. */
+    /** Every user who has acted on this application in the CURRENT review cycle. */
     public function actorsWhoHaveActed(): array
     {
         return $this->actions()
@@ -63,5 +63,43 @@ class LoanApplication extends Model
             ->pluck('actor_id')
             ->unique()
             ->all();
+    }
+
+    /**
+     * Segregation of duty for the review chain: has this user already acted, in
+     * the current review cycle, at a DIFFERENT review step (recommend/approve)?
+     * Acting again at the same step is allowed, which is what happens when an
+     * application is returned to you. Guarantor actions have no step and count
+     * as "another step", so a guarantor cannot also review the loan. The
+     * operational steps after approval (settlement, disbursement, cross-check)
+     * are not review steps and are never counted.
+     */
+    public function hasActedAtAnotherStage(int $userId, int $stageId): bool
+    {
+        return $this->actions()
+            ->where('review_cycle', $this->review_cycle)
+            ->where('actor_id', $userId)
+            ->where(function ($q) use ($stageId) {
+                $q->whereNull('stage_id')
+                    ->orWhereHas('stage', function ($s) use ($stageId) {
+                        $s->where('approval_stages.id', '!=', $stageId)
+                            ->whereIn('approval_stages.action_type', ['recommend', 'approve']);
+                    });
+            })
+            ->exists();
+    }
+
+    /** The step before the current one, or null when the current step is the first. */
+    public function previousStage(): ?ApprovalStage
+    {
+        $current = $this->currentStage;
+        if (!$current) {
+            return null;
+        }
+
+        return $this->workflow->stages()
+            ->where('sequence', '<', $current->sequence)
+            ->reorder('sequence', 'desc')
+            ->first();
     }
 }

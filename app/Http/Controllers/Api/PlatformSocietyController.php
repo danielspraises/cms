@@ -56,6 +56,7 @@ class PlatformSocietyController extends Controller
             // Clone system role templates AND seed the default 4-stage
             // approval workflow (blueprint §7.1) — one call, one place.
             $this->provisioning->provision($society);
+            $this->provisioning->grantSocietyAdminRole($society, $admin);
 
             return response()->json([
                 'society' => $society,
@@ -98,6 +99,8 @@ class PlatformSocietyController extends Controller
             'password' => Hash::make($validated['password']),
             'status' => 'active',
         ]);
+
+        $this->provisioning->grantSocietyAdminRole($society, $admin);
 
         return response()->json($admin->makeHidden('password'), 201);
     }

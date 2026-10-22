@@ -5,11 +5,10 @@ namespace App\Services;
 use App\Models\ApprovalWorkflow;
 use App\Models\Role;
 use App\Models\Society;
+use App\Models\User;
 
 /**
- * Everything a brand-new society needs seeded at creation time, in one
- * place, so PlatformSocietyController::store() isn't doing this inline.
- * Called once, right after the society + first admin are created.
+ * Everything a brand-new society needs seeded at creation time.
  */
 class SocietyProvisioningService
 {
@@ -17,6 +16,19 @@ class SocietyProvisioningService
     {
         $clonedRoles = $this->cloneSystemRoleTemplates($society);
         $this->createDefaultWorkflow($society, $clonedRoles);
+    }
+
+    /**
+     * Gives a society admin the Society Admin role, which owns the first review
+     * step, the settlement step and the cross-check. Call for every society admin created.
+     */
+    public function grantSocietyAdminRole(Society $society, User $user): void
+    {
+        $role = Role::where('society_id', $society->id)->where('slug', 'society-admin')->first();
+
+        if ($role) {
+            $user->roles()->syncWithoutDetaching([$role->id => ['assigned_at' => now()]]);
+        }
     }
 
     private function cloneSystemRoleTemplates(Society $society): array
@@ -38,54 +50,47 @@ class SocietyProvisioningService
     }
 
     /**
-     * Builds the 4-stage chain from blueprint §7.1: Society Admin (recommend,
-     * permission-based since admin isn't a "role" in the roles table) ->
-     * Treasurer (recommend, role-based) -> Approver (approve, role-based) ->
-     * Treasurer (disburse, permission-based so any holder of loans.disburse
-     * can do it, not necessarily the same treasurer who recommended).
+     * The default chain. Every step belongs to ONE role, so nobody can take a
+     * step that is someone else's:
+     *   1 Society Admin Review      recommend  Society Admin
+     *   2 Treasurer Review          recommend  Treasurer
+     *   3 Final Approval            approve    Approver
+     *   4 Settlement                prepare    Society Admin
+     *   5 Disbursement              disburse   Treasurer
+     *   6 Cross-check and posting   confirm    Society Admin
      */
     private function createDefaultWorkflow(Society $society, array $clonedRoles): void
     {
+        foreach (['society-admin', 'treasurer', 'approver'] as $slug) {
+            if (!isset($clonedRoles[$slug])) {
+                throw new \RuntimeException("The '{$slug}' role template is missing. Run: php artisan db:seed --class=RoleSeeder");
+            }
+        }
+
         $workflow = ApprovalWorkflow::create([
             'society_id' => $society->id,
             'name' => 'Standard Loan Approval',
             'is_default' => true,
         ]);
 
-        $workflow->stages()->create([
-            'sequence' => 1,
-            'name' => 'Society Admin Review',
-            'action_type' => 'recommend',
-            'assignment_type' => 'permission',
-            'assignment_permission_key' => 'loans.recommend',
-            'notes_required' => true,
-        ]);
+        $steps = [
+            ['Society Admin Review', 'recommend', 'society-admin', true],
+            ['Treasurer Review', 'recommend', 'treasurer', true],
+            ['Final Approval', 'approve', 'approver', false],
+            ['Settlement', 'prepare', 'society-admin', false],
+            ['Disbursement', 'disburse', 'treasurer', false],
+            ['Cross-check and posting', 'confirm', 'society-admin', false],
+        ];
 
-        $workflow->stages()->create([
-            'sequence' => 2,
-            'name' => 'Treasurer Review',
-            'action_type' => 'recommend',
-            'assignment_type' => 'role',
-            'assignment_role_id' => $clonedRoles['treasurer']->id,
-            'notes_required' => true,
-        ]);
-
-        $workflow->stages()->create([
-            'sequence' => 3,
-            'name' => 'Final Approval',
-            'action_type' => 'approve',
-            'assignment_type' => 'role',
-            'assignment_role_id' => $clonedRoles['approver']->id,
-            'notes_required' => false,
-        ]);
-
-        $workflow->stages()->create([
-            'sequence' => 4,
-            'name' => 'Disbursement',
-            'action_type' => 'disburse',
-            'assignment_type' => 'permission',
-            'assignment_permission_key' => 'loans.disburse',
-            'notes_required' => false,
-        ]);
+        foreach ($steps as $index => [$name, $type, $roleSlug, $notesRequired]) {
+            $workflow->stages()->create([
+                'sequence' => $index + 1,
+                'name' => $name,
+                'action_type' => $type,
+                'assignment_type' => 'role',
+                'assignment_role_id' => $clonedRoles[$roleSlug]->id,
+                'notes_required' => $notesRequired,
+            ]);
+        }
     }
 }

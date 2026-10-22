@@ -5,26 +5,22 @@ namespace App\Services;
 use App\Models\Account;
 use App\Models\LedgerEntry;
 use App\Models\LedgerLine;
-use App\Models\User;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
 /**
- * The single write path into the ledger. Every place in the old codebase that did
- * $wpdb->insert($table, [...]) directly — loan disbursement, savings credit/debit,
- * deduction distribution, manual entries, payment allocation — now goes through here
- * instead of duplicating the "update balance, insert row" pattern a dozen times.
+ * The single write path into the ledger. Every write happens inside a DB
+ * transaction, updates the account's cached balance with the line insert, and
+ * records the running balance on each line.
  *
- * Guarantees:
- *  - every write happens inside a DB transaction
- *  - the account's cached balance is updated atomically with the line insert
- *  - every line records the running balance at insert time (fast history reads,
- *    no need to re-sum on every ledger view like the old shortcodes did)
+ * A line may carry a loan_id. For loan accounts, that keeps the loan's own
+ * disbursed and repaid figures in step in the same transaction, which is what
+ * lets a payment or a settlement credit land on exactly the right loan.
  */
 class LedgerService
 {
     /**
-     * @param array<int, array{user_id:int, account_type:string, direction:string, amount_minor:int}> $lines
+     * @param array<int, array{user_id:int, account_type:string, direction:string, amount_minor:int, loan_id?:int|null}> $lines
      */
     public function postEntry(
         int $societyId,
@@ -55,11 +51,11 @@ class LedgerService
 
             foreach ($lines as $line) {
                 if ($line['amount_minor'] <= 0) {
-                    continue; // mirrors old "only insert if amount > 0" guards
+                    continue;
                 }
 
                 $account = Account::query()
-                    ->lockForUpdate() // prevent lost updates under concurrent writes
+                    ->lockForUpdate()
                     ->firstOrCreate(
                         ['user_id' => $line['user_id'], 'account_type' => $line['account_type']]
                     );
@@ -71,20 +67,43 @@ class LedgerService
                 LedgerLine::create([
                     'entry_id' => $entry->id,
                     'account_id' => $account->id,
+                    'loan_id' => $line['loan_id'] ?? null,
                     'direction' => $line['direction'],
                     'amount_minor' => $line['amount_minor'],
                     'running_balance_minor' => $account->balance_minor,
                 ]);
+
+                if (!empty($line['loan_id'])) {
+                    $this->applyToLoan($line);
+                }
             }
 
             return $entry->load('lines');
         });
     }
 
+    /** Keeps the named loan's own disbursed/repaid figures in step with the ledger line. */
+    private function applyToLoan(array $line): void
+    {
+        $column = match ([$line['account_type'], $line['direction']]) {
+            ['loan_principal', 'debit'] => 'principal_disbursed_minor',
+            ['loan_principal', 'credit'] => 'principal_repaid_minor',
+            ['loan_interest', 'debit'] => 'interest_disbursed_minor',
+            ['loan_interest', 'credit'] => 'interest_repaid_minor',
+            ['sales_loan', 'debit'] => 'sales_disbursed_minor',
+            ['sales_loan', 'credit'] => 'sales_repaid_minor',
+            default => null,
+        };
+
+        if ($column !== null) {
+            DB::table('loans')->where('id', $line['loan_id'])->increment($column, $line['amount_minor']);
+        }
+    }
+
     /**
-     * Reverses an entry with new offsetting lines rather than deleting history —
-     * replaces the old "undo batch" pattern which did a hard DELETE FROM ledger.
-     * Deleting history destroys the audit trail; reversing preserves it.
+     * Reverses an entry with new offsetting lines rather than deleting history.
+     * A reversed loan line is booked as the opposite direction, so the loan's
+     * remaining balance comes out right even though its repaid figure rises.
      */
     public function reverseEntry(LedgerEntry $original, ?int $actorId = null, ?string $reason = null): LedgerEntry
     {
@@ -93,6 +112,7 @@ class LedgerService
             'account_type' => $line->account->account_type,
             'direction' => $line->direction === 'credit' ? 'debit' : 'credit',
             'amount_minor' => $line->amount_minor,
+            'loan_id' => $line->loan_id,
         ])->all();
 
         $reversal = $this->postEntry(

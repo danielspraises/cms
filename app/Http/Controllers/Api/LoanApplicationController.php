@@ -16,19 +16,39 @@ class LoanApplicationController extends Controller
     public function show(Request $request, LoanApplication $application)
     {
         abort_unless($request->user()->canActOnSociety($application->society_id), 404);
-        $application->load(['member', 'product', 'guarantors.guarantor', 'actions.actor', 'currentStage']);
 
-        // Tells the screen whether THIS user can act right now, using the same
-        // checks act() enforces, so the UI never has to guess.
+        abort_unless($request->user()->hasPermission('loans.view') || $application->member_id === $request->user()->id, 403);
+
+        $application->load([
+            'member',
+            'product',
+            'guarantors.guarantor',
+            'actions.actor',
+            'actions.stage:id,name',
+            'currentStage.assignmentRole:id,name',
+        ]);
+
         $user = $request->user();
         $stage = $application->currentStage;
         $actionable = in_array($application->status, ['in_review', 'approved'], true);
 
+        // Whether THIS user can act right now, using the same checks act()
+        // enforces, so the screen never has to guess.
         $application->setAttribute('can_act', $actionable
             && $stage !== null
             && $stage->canBeActedOnBy($user)
-            && ($stage->action_type === 'disburse'
-                || !in_array($user->id, $application->actorsWhoHaveActed(), true)));
+            && (!in_array($stage->action_type, ['recommend', 'approve'], true)
+                || !$application->hasActedAtAnotherStage($user->id, $stage->id)));
+
+        // Where a "return" from the current stage would send the application.
+        $returnTo = null;
+        if ($stage !== null && $stage->action_type !== 'prepare') {
+            $previous = $application->previousStage();
+            $returnTo = $previous
+                ? ['kind' => 'stage', 'name' => $previous->name]
+                : ['kind' => 'applicant', 'name' => 'the applicant'];
+        }
+        $application->setAttribute('return_to', $returnTo);
 
         return $application;
     }
@@ -64,6 +84,17 @@ class LoanApplicationController extends Controller
             'guarantor_member_ids.*' => 'exists:users,id',
         ]);
 
+        $product = \App\Models\LoanProduct::findOrFail($validated['loan_product_id']);
+
+        // A member can only apply for their own society's loan types.
+        abort_unless($product->society_id === $request->user()->society_id, 404);
+
+        if ($product->max_tenure_months && $validated['requested_tenure_months'] > $product->max_tenure_months) {
+            return response()->json([
+                'message' => "The maximum tenure for {$product->name} is {$product->max_tenure_months} months.",
+            ], 422);
+        }
+
         $application = $this->approval->submit(
             $request->user(),
             $validated['loan_product_id'],
@@ -96,13 +127,13 @@ class LoanApplicationController extends Controller
         return $updated;
     }
 
-    /** The core action endpoint: recommend / approve / reject / disburse, per current stage. */
+    /** The core action endpoint: recommend / approve / reject / return / disburse, per current stage. */
     public function act(Request $request, LoanApplication $application)
     {
         abort_unless($request->user()->canActOnSociety($application->society_id), 404);
 
         $validated = $request->validate([
-            'decision' => 'required|in:recommend,approve,reject,disburse',
+            'decision' => 'required|in:recommend,approve,reject,return',
             'notes' => 'nullable|string',
         ]);
 
@@ -145,11 +176,12 @@ class LoanApplicationController extends Controller
         $user = $request->user();
 
         return LoanApplication::where('society_id', $request->attributes->get('society_id'))
-            ->where('status', 'in_review')
+            ->whereIn('status', ['in_review', 'approved'])
             ->with('currentStage')
             ->get()
             ->filter(fn (LoanApplication $app) => $app->currentStage?->canBeActedOnBy($user)
-                && !in_array($user->id, $app->actorsWhoHaveActed(), true))
+                && (!in_array($app->currentStage->action_type, ['recommend', 'approve'], true)
+                || !$app->hasActedAtAnotherStage($user->id, $app->current_stage_id)))
             ->values();
     }
 }

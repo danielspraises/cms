@@ -13,9 +13,13 @@ class LoanProduct extends Model
     protected $fillable = [
         'society_id', 'name', 'type', 'interest_method',
         'requires_guarantors', 'guarantors_required', 'rejection_mode', 'approval_workflow_id',
+        'max_tenure_months', 'interest_bands',
     ];
 
-    protected $casts = ['requires_guarantors' => 'boolean'];
+    protected $casts = [
+        'requires_guarantors' => 'boolean',
+        'interest_bands' => 'array',
+    ];
 
     public function society(): BelongsTo
     {

@@ -24,17 +24,18 @@ class ApprovalStage extends Model
         return $this->belongsTo(Role::class, 'assignment_role_id');
     }
 
-    /** Can this specific user act on this stage, purely on eligibility (not yet checking segregation of duty)? */
+    /**
+     * Can this user take part in this stage? Eligibility only; segregation of
+     * duty is checked separately in LoanApprovalService.
+     *
+     * Platform admins oversee the platform and never take part in a society's
+     * approval chain. Everyone else, society admins included, must match the
+     * stage's own assignment: the specific role, or the permission.
+     */
     public function canBeActedOnBy(User $user): bool
     {
-        if (in_array($user->role, ['platform_admin', 'society_admin'], true)) {
-            // Even the blanket-access roles must satisfy the stage's intended
-            // assignment conceptually — but segregation of duty (checked
-            // separately in LoanApprovalService) is what actually constrains
-            // them, not stage eligibility. An admin is eligible for every
-            // stage by design; whether they're ALLOWED to act on THIS
-            // application is a separate, per-application check.
-            return true;
+        if ($user->role === 'platform_admin') {
+            return false;
         }
 
         if ($this->assignment_type === 'role') {

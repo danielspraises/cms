@@ -3,15 +3,22 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
+use App\Models\ApprovalWorkflow;
 use App\Models\LoanProduct;
+use App\Services\InterestCalculator;
 use Illuminate\Http\Request;
+use Illuminate\Validation\Rule;
+use InvalidArgumentException;
 
 /**
- * Society-admin-facing loan type management (blueprint §7.5). "Loan type"
- * in the product/UI language maps to the LoanProduct model in code.
+ * Society-admin loan type management. "Loan type" in the product language is
+ * the LoanProduct model. Each type carries its guarantor rule, its approval
+ * workflow, its maximum tenure and its interest bands.
  */
 class LoanTypeController extends Controller
 {
+    public function __construct(private InterestCalculator $interest) {}
+
     public function index(Request $request)
     {
         return LoanProduct::where('society_id', $request->attributes->get('society_id'))
@@ -29,35 +36,83 @@ class LoanTypeController extends Controller
             'interest_method' => 'required|in:flat,reducing_balance',
             'requires_guarantors' => 'required|boolean',
             'guarantors_required' => 'required_if:requires_guarantors,true|nullable|integer|min:1',
-            'rejection_mode' => 'required|in:hard_reject,return_for_changes',
-            'approval_workflow_id' => 'nullable|exists:approval_workflows,id',
+            'approval_workflow_id' => ['nullable', Rule::exists('approval_workflows', 'id')->where('society_id', $societyId)],
+            'max_tenure_months' => 'nullable|integer|min:1|max:600',
+            'interest_bands' => 'nullable|array',
+            'interest_bands.*.from_months' => 'required|integer|min:1',
+            'interest_bands.*.to_months' => 'required|integer|min:1',
+            'interest_bands.*.rate_percent' => 'required|numeric|min:0|max:100',
         ]);
 
-        // Default to the society's standard chain if none specified —
-        // admin can build and assign a custom (e.g. shorter) workflow later.
+        try {
+            $bands = $this->interest->normalizeBands(
+                $validated['interest_bands'] ?? [],
+                $validated['max_tenure_months'] ?? null
+            );
+        } catch (InvalidArgumentException $e) {
+            return response()->json(['message' => $e->getMessage()], 422);
+        }
+
+        if (array_key_exists('guarantors_required', $validated) && $validated['guarantors_required'] === null) {
+            unset($validated['guarantors_required']);
+        }
+
+        // Default to the society's standard chain if none specified.
         if (empty($validated['approval_workflow_id'])) {
-            $default = \App\Models\ApprovalWorkflow::where('society_id', $societyId)
+            $default = ApprovalWorkflow::where('society_id', $societyId)
                 ->where('is_default', true)->first();
             $validated['approval_workflow_id'] = $default?->id;
         }
 
-        return LoanProduct::create($validated + ['society_id' => $societyId]);
+        return LoanProduct::create(
+            array_merge($validated, ['society_id' => $societyId, 'interest_bands' => $bands])
+        );
     }
 
-    public function update(Request $request, LoanProduct $loanType)
+    public function update(Request $request, string $society, LoanProduct $loanType)
     {
-        abort_unless($loanType->society_id === $request->attributes->get('society_id'), 404);
+        $societyId = $request->attributes->get('society_id');
+        abort_unless($loanType->society_id === $societyId, 404);
 
         $validated = $request->validate([
             'name' => 'sometimes|string',
             'requires_guarantors' => 'sometimes|boolean',
             'guarantors_required' => 'sometimes|integer|min:1',
-            'rejection_mode' => 'sometimes|in:hard_reject,return_for_changes',
-            'approval_workflow_id' => 'sometimes|exists:approval_workflows,id',
+            'approval_workflow_id' => ['sometimes', Rule::exists('approval_workflows', 'id')->where('society_id', $societyId)],
+            'max_tenure_months' => 'sometimes|nullable|integer|min:1|max:600',
+            'interest_bands' => 'sometimes|nullable|array',
+            'interest_bands.*.from_months' => 'required|integer|min:1',
+            'interest_bands.*.to_months' => 'required|integer|min:1',
+            'interest_bands.*.rate_percent' => 'required|numeric|min:0|max:100',
         ]);
+
+        // Changing either the maximum tenure or the bands means the pair has to
+        // be valid together, so check them as a set.
+        if ($request->hasAny(['max_tenure_months', 'interest_bands'])) {
+            $max = $request->has('max_tenure_months')
+                ? ($validated['max_tenure_months'] ?? null)
+                : $loanType->max_tenure_months;
+
+            $bandsInput = $request->has('interest_bands')
+                ? ($validated['interest_bands'] ?? [])
+                : collect($loanType->interest_bands ?? [])
+                    ->map(fn (array $b) => [
+                        'from_months' => $b['from_months'],
+                        'to_months' => $b['to_months'],
+                        'rate_percent' => $b['rate_bp'] / 100,
+                    ])->all();
+
+            try {
+                $validated['interest_bands'] = $this->interest->normalizeBands($bandsInput, $max);
+            } catch (InvalidArgumentException $e) {
+                return response()->json(['message' => $e->getMessage()], 422);
+            }
+
+            $validated['max_tenure_months'] = $max;
+        }
 
         $loanType->update($validated);
 
-        return $loanType;
+        return $loanType->fresh();
     }
 }
